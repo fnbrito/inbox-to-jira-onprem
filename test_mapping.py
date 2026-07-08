@@ -273,5 +273,17 @@ class TestLabelRules(unittest.TestCase):
         self.assertEqual(f["labels"].count("email-intake"), 1)   # deduped
 
 
+class TestLabelRuleNegation(unittest.TestCase):
+    def test_not_from_domain(self):
+        rules = {"!@example.com": ["external"]}
+        self.assertEqual(e2j.labels_for_sender(rules, "bob@example.com"), [])
+        self.assertEqual(e2j.labels_for_sender(rules, "cust@gmail.com"), ["external"])
+
+    def test_negated_exact_address(self):
+        rules = {"!vip@x.com": ["not-vip"]}
+        self.assertEqual(e2j.labels_for_sender(rules, "vip@x.com"), [])
+        self.assertEqual(e2j.labels_for_sender(rules, "other@x.com"), ["not-vip"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

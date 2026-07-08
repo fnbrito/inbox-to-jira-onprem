@@ -340,17 +340,22 @@ def format_recipients(recipients):
 def labels_for_sender(rules, sender):
     """Labels to add based on the sender, per [label_rules].
 
-    A rule key is a full address (user@domain) or a domain (@domain).
+    A rule key is one of:
+      user@domain    exact sender address
+      @domain        any sender in that domain
+      !user@domain   any sender EXCEPT that address
+      !@domain       any sender NOT in that domain (e.g. tag external senders)
     """
     s = (sender or "").strip().lower()
     out = []
-    if s:
-        for pat, labels in (rules or {}).items():
-            if pat.startswith("@"):
-                if s.endswith(pat):
-                    out += labels
-            elif pat == s:
-                out += labels
+    if not s:
+        return out
+    for pat, labels in (rules or {}).items():
+        negate = pat.startswith("!")
+        p = pat[1:] if negate else pat
+        matched = s.endswith(p) if p.startswith("@") else (p == s)
+        if matched != negate:      # (matches and not negated) or (no match and negated)
+            out += labels
     return out
 
 

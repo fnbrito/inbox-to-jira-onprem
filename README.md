@@ -163,13 +163,15 @@ Jira Server can't set an arbitrary comment author, so no impersonation is done.
 ## Label rules
 
 Add labels automatically based on the sender via a `[label_rules]` section. Each
-key is a full address (`user@domain`) or a domain (`@domain`); the value is a
-comma-separated list of labels:
+key is a full address (`user@domain`), a domain (`@domain`), or either of those
+negated with a leading `!` (`!user@domain`, `!@domain`) to match everything
+*except* that address/domain. The value is a comma-separated list of labels:
 
 ```ini
 [label_rules]
 orders@example.com = sales-orders
 @vendor.com = vendor, external
+!@example.com = external
 ```
 
 ## Testing
