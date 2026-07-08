@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-email_to_jira.py - Path C-1 bridge for BIS Email-to-Jira automation.
+email_to_jira.py - bridge that turns emails in a shared mailbox into Jira issues.
 
-Reads a Microsoft 365 mailbox (e.g. bishelp@maplesoft.com) via Microsoft Graph
-using OAuth 2.0 (app-only / client-credentials), and creates Jira "Support
-Request" issues on the on-prem Jira (8.6.1) via its REST API. Replies on the
-same email thread are appended as a comment to the existing issue instead of
-creating a duplicate.
+Reads a Microsoft 365 mailbox (e.g. support@example.com) via Microsoft Graph
+using OAuth 2.0 (app-only / client-credentials), and creates Jira issues (default
+type "Support Request") on an on-premise Jira Server/Data Center instance via its
+REST API. Replies on the same email thread are appended as a comment to the
+existing issue instead of creating a duplicate.
 
 Why this exists
 ---------------
-Jira 8.6.1's native mail handler can only sign in to a mailbox with basic auth,
-and Microsoft has permanently disabled basic auth for IMAP/POP on Microsoft 365.
-Jira didn't gain OAuth 2.0 mail support until 8.22. This bridge performs the
-OAuth on the M365 side (via Graph) and talks to Jira over its REST API, so it
-needs no Jira upgrade and no paid marketplace app.
+Older Jira Server versions can only sign in to a mailbox with basic auth, and
+Microsoft has permanently disabled basic auth for IMAP/POP on Microsoft 365. Jira
+only gained OAuth 2.0 mail support in 8.22. This bridge performs the OAuth on the
+M365 side (via Graph) and talks to Jira over its REST API, so it needs no Jira
+upgrade and no paid marketplace app.
 
 Modes
 -----
     python3 email_to_jira.py --preflight   Check config + connectivity. Lists the
-                                           Support Request issue-type id and any
-                                           required create fields. Writes nothing.
+                                           issue-type id and any required create
+                                           fields. Writes nothing.
     python3 email_to_jira.py --dry-run     Fetch mail and print what WOULD happen.
-                                           Creates/comments/uploads nothing and
-                                           does not mark mail as read.
+                                           Creates/comments/uploads nothing.
     python3 email_to_jira.py               Process the mailbox once, for real.
     python3 email_to_jira.py --loop --interval 60
                                            Keep processing every N seconds.
@@ -115,6 +114,16 @@ class Config:
         self.add_cc_watchers = cp.getboolean("behavior", "add_cc_watchers", fallback=False)
         self.inline_image_min_kb = cp.getint("behavior", "inline_image_min_kb", fallback=20)
         self.include_email_header = cp.getboolean("behavior", "include_email_header", fallback=True)
+        self.processed_folder = cp.get("behavior", "processed_folder", fallback="").strip()
+        self.mention_sender_in_comments = cp.getboolean("behavior", "mention_sender_in_comments", fallback=False)
+
+        # [label_rules] -> {sender pattern (email or @domain): [labels]}
+        self.label_rules = {}
+        if cp.has_section("label_rules"):
+            for _pat, _val in cp.items("label_rules"):
+                _labels = [x.strip() for x in _val.split(",") if x.strip()]
+                if _labels:
+                    self.label_rules[_pat.strip().lower()] = _labels
 
     def validate(self):
         missing = []
@@ -328,6 +337,23 @@ def format_recipients(recipients):
     return ", ".join(parts)
 
 
+def labels_for_sender(rules, sender):
+    """Labels to add based on the sender, per [label_rules].
+
+    A rule key is a full address (user@domain) or a domain (@domain).
+    """
+    s = (sender or "").strip().lower()
+    out = []
+    if s:
+        for pat, labels in (rules or {}).items():
+            if pat.startswith("@"):
+                if s.endswith(pat):
+                    out += labels
+            elif pat == s:
+                out += labels
+    return out
+
+
 def build_issue_fields(cfg, msg, body_text, reporter_override=None):
     """Map a Graph message dict to Jira create-issue fields."""
     summary = (msg.get("subject") or "(no subject)").strip()
@@ -354,8 +380,12 @@ def build_issue_fields(cfg, msg, body_text, reporter_override=None):
     else:
         description = body_text
 
+    sender_addr0 = ((msg.get("from") or {}).get("emailAddress", {}) or {}).get("address", "")
     labels = [conversation_label(cfg.label_prefix, msg.get("conversationId"))]
-    labels += [x for x in getattr(cfg, "extra_labels", []) if x]
+    for _lab in (list(getattr(cfg, "extra_labels", []))
+                 + labels_for_sender(getattr(cfg, "label_rules", {}), sender_addr0)):
+        if _lab and _lab not in labels:
+            labels.append(_lab)
 
     fields = {
         "project": {"key": cfg.project_key},
@@ -404,18 +434,20 @@ def graph_get(token, path, params=None):
     return r.json()
 
 
-def fetch_unread(cfg, token, top=None):
-    """Return up to `top` (default fetch_limit) unread Inbox messages, oldest first."""
-    data = graph_get(
-        token,
-        f"/users/{cfg.mailbox}/mailFolders/Inbox/messages",
-        params={
-            "$filter": "isRead eq false",
-            "$top": str(top or cfg.fetch_limit),
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,"
-                       "body,bodyPreview,hasAttachments,conversationId,internetMessageId",
-        },
-    )
+def fetch_unread(cfg, token, top=None, only_unread=True):
+    """Return up to `top` (default fetch_limit) Inbox messages, oldest first.
+
+    only_unread=False (processed_folder mode) returns all Inbox mail regardless of
+    read state, so processing no longer depends on whether a message was opened.
+    """
+    params = {
+        "$top": str(top or cfg.fetch_limit),
+        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,"
+                   "body,bodyPreview,hasAttachments,conversationId,internetMessageId",
+    }
+    if only_unread:
+        params["$filter"] = "isRead eq false"
+    data = graph_get(token, f"/users/{cfg.mailbox}/mailFolders/Inbox/messages", params=params)
     msgs = data.get("value", [])
     msgs.sort(key=lambda m: m.get("receivedDateTime", ""))  # oldest first
     return msgs
@@ -477,6 +509,32 @@ def mark_read(cfg, token, message_id):
         json={"isRead": True},
         timeout=HTTP_TIMEOUT,
     )
+    r.raise_for_status()
+
+
+def ensure_folder(cfg, token, name):
+    """Return the id of a top-level mail folder, creating it if missing."""
+    hdr = {"Authorization": f"Bearer {token}"}
+    r = requests.get(f"{GRAPH}/users/{cfg.mailbox}/mailFolders",
+                     headers=hdr, params={"$top": "200", "$select": "id,displayName"},
+                     timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    for f in r.json().get("value", []):
+        if (f.get("displayName") or "").lower() == name.lower():
+            return f["id"]
+    r = requests.post(f"{GRAPH}/users/{cfg.mailbox}/mailFolders",
+                      headers={**hdr, "Content-Type": "application/json"},
+                      json={"displayName": name}, timeout=HTTP_TIMEOUT)
+    if r.status_code >= 300:
+        raise BridgeError(f"Could not create folder {name!r}: {r.status_code} {r.text[:200]}")
+    return r.json()["id"]
+
+
+def move_message(cfg, token, message_id, folder_id):
+    r = requests.post(
+        f"{GRAPH}/users/{cfg.mailbox}/messages/{message_id}/move",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"destinationId": folder_id}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
 
@@ -588,10 +646,24 @@ def process_once(cfg, dry_run=False, match_subject=None):
     s = jira_session(cfg)
     own = (cfg.jira_user, cfg.mailbox)
 
-    msgs = fetch_unread(cfg, token, top=200 if match_subject else None)
+    folder = getattr(cfg, "processed_folder", "")
+    folder_id = ensure_folder(cfg, token, folder) if (folder and not dry_run) else None
+
+    msgs = fetch_unread(cfg, token, top=200 if match_subject else None,
+                        only_unread=not folder)
     if match_subject:
         msgs = [m for m in msgs if match_subject.lower() in (m.get("subject") or "").lower()]
     LOG.info("Fetched %d message(s) to process from %s", len(msgs), cfg.mailbox)
+
+    def finalize(mid):
+        # Track processed mail by MOVING it out of the Inbox (preferred), else by
+        # marking read. Never touched on error, so failures retry next run.
+        if dry_run:
+            return
+        if folder_id:
+            move_message(cfg, token, mid, folder_id)
+        elif cfg.mark_read:
+            mark_read(cfg, token, mid)
 
     created = updated = skipped = errored = 0
     for msg in msgs:
@@ -600,8 +672,7 @@ def process_once(cfg, dry_run=False, match_subject=None):
             skip, reason = should_skip_message(msg, cfg.skip_auto_replies, own)
             if skip:
                 LOG.info("SKIP  %-55.55s | %s", subject, reason)
-                if not dry_run and cfg.mark_read:
-                    mark_read(cfg, token, msg["id"])
+                finalize(msg["id"])
                 skipped += 1
                 continue
 
@@ -623,9 +694,14 @@ def process_once(cfg, dry_run=False, match_subject=None):
                     LOG.info("DRY   would COMMENT on %s <- reply %r", existing, subject)
                 else:
                     frm = (msg.get("from") or {}).get("emailAddress", {})
+                    mention = ""
+                    if getattr(cfg, "mention_sender_in_comments", False):
+                        un = jira_find_username(cfg, s, frm.get("address"))
+                        if un:
+                            mention = f"[~{un}] "
                     jira_add_comment(
                         cfg, s, existing,
-                        f"Reply received by email from {frm.get('name', '')} "
+                        f"{mention}Reply received by email from {frm.get('name', '')} "
                         f"<{frm.get('address', '')}> on {msg.get('receivedDateTime', '')}:"
                         f"\n\n{body_text}",
                     )
@@ -656,13 +732,12 @@ def process_once(cfg, dry_run=False, match_subject=None):
                     apply_watchers(cfg, s, key, msg, dry_run)
                 created += 1
 
-            if not dry_run and cfg.mark_read:
-                mark_read(cfg, token, msg["id"])
+            finalize(msg["id"])
 
         except Exception as exc:  # one bad message must not stop the batch
             errored += 1
             LOG.error("ERROR processing %r: %s", subject, exc)
-            # leave the message unread so the next run retries it
+            # leave it in the Inbox (unmoved) so the next run retries it
 
     LOG.info("Done. created=%d updated=%d skipped=%d errored=%d%s",
              created, updated, skipped, errored,

@@ -80,6 +80,9 @@ template). The two secrets can be supplied via environment variables
 | `[behavior]` | `reporter_from_sender`, `add_cc_watchers` | people mapping |
 | `[behavior]` | `upload_attachments`, `max_attachment_mb`, `inline_image_min_kb` | attachments |
 | `[behavior]` | `include_email_header` | include the From/To/Cc block in the description |
+| `[behavior]` | `processed_folder` | move processed mail here instead of using read/unread |
+| `[behavior]` | `mention_sender_in_comments` | `@`-mention the sender on reply comments |
+| `[label_rules]` | `<addr or @domain> = labels` | add labels based on who sent the email |
 
 ## Microsoft Entra (Azure AD) setup
 
@@ -142,6 +145,32 @@ schtasks /Create /TN "email-to-jira" /SC MINUTE /MO 1 ^
   `inline_image_min_kb` are dropped to skip signature logos.
 - **Formatting** — HTML is converted to Jira wiki markup (best-effort). Your Jira
   Description field should use the **wiki renderer** for images/links to render.
+
+## Processing & tracking
+
+The bridge tracks which mail it has handled by **moving processed messages into
+`processed_folder`** (created if missing), reading the *entire* Inbox each pass —
+so processing never depends on a message's read/unread state (it's safe even if
+someone opens a message before the bridge runs). Leave `processed_folder` blank to
+fall back to marking messages read. Messages that error are left in place and
+retried on the next run.
+
+Replies on an existing email thread are added as **comments** on the matching
+issue; with `mention_sender_in_comments = true` the comment `@`-mentions the
+sender when they are a Jira user. The comment is posted by the service account —
+Jira Server can't set an arbitrary comment author, so no impersonation is done.
+
+## Label rules
+
+Add labels automatically based on the sender via a `[label_rules]` section. Each
+key is a full address (`user@domain`) or a domain (`@domain`); the value is a
+comma-separated list of labels:
+
+```ini
+[label_rules]
+orders@example.com = sales-orders
+@vendor.com = vendor, external
+```
 
 ## Testing
 

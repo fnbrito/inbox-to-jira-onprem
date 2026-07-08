@@ -14,7 +14,7 @@ import email_to_jira as e2j
 
 def fake_cfg():
     c = types.SimpleNamespace()
-    c.project_key = "BISSB"
+    c.project_key = "SUP"
     c.issue_type = "Support Request"
     c.label_prefix = "eml"
     return c
@@ -74,8 +74,8 @@ class TestShouldSkip(unittest.TestCase):
 
     def test_loop_guard_on_own_address(self):
         skip, reason = e2j.should_skip_message(
-            self._msg(sender="svc-bishelp@maplesoft.com"), True,
-            own_addresses=("svc-bishelp@maplesoft.com",))
+            self._msg(sender="svc-inbox@example.com"), True,
+            own_addresses=("svc-inbox@example.com",))
         self.assertTrue(skip)
         self.assertIn("loop", reason)
 
@@ -96,7 +96,7 @@ class TestBuildIssueFields(unittest.TestCase):
 
     def test_maps_core_fields(self):
         f = e2j.build_issue_fields(fake_cfg(), self._msg(), "The printer won't turn on.")
-        self.assertEqual(f["project"], {"key": "BISSB"})
+        self.assertEqual(f["project"], {"key": "SUP"})
         self.assertEqual(f["issuetype"], {"name": "Support Request"})
         self.assertEqual(f["summary"], "Printer down on 3rd floor")
         self.assertIn("jane@acme.com", f["description"])
@@ -124,10 +124,10 @@ class TestRequiredFields(unittest.TestCase):
 
     def test_reporter_and_extra_fields_applied(self):
         c = fake_cfg()
-        c.default_reporter = "svc-bishelp"
+        c.default_reporter = "svc-inbox"
         c.extra_fields = {"customfield_10801": "3"}  # Tempo account id as a string
         f = e2j.build_issue_fields(c, self._msg(), "body")
-        self.assertEqual(f["reporter"], {"name": "svc-bishelp"})
+        self.assertEqual(f["reporter"], {"name": "svc-inbox"})
         self.assertEqual(f["customfield_10801"], "3")
 
     def test_no_reporter_when_unset(self):
@@ -140,7 +140,7 @@ class TestRecipientsAndReporter(unittest.TestCase):
         return {
             "subject": "Help",
             "from": {"emailAddress": {"name": "Kari", "address": "kari@x.com"}},
-            "toRecipients": [{"emailAddress": {"name": "BIS", "address": "bishelp@maplesoft.com"}}],
+            "toRecipients": [{"emailAddress": {"name": "Support Desk", "address": "support@example.com"}}],
             "ccRecipients": [{"emailAddress": {"name": "Fran", "address": "fran@x.com"}}],
             "conversationId": "c",
         }
@@ -156,17 +156,17 @@ class TestRecipientsAndReporter(unittest.TestCase):
 
     def test_reporter_override_and_recipients_in_description(self):
         c = fake_cfg()
-        c.default_reporter = "svc-bishelp"
+        c.default_reporter = "svc-inbox"
         f = e2j.build_issue_fields(c, self._msg(), "body", reporter_override="kari")
         self.assertEqual(f["reporter"], {"name": "kari"})       # sender beats default
         self.assertIn("fran@x.com", f["description"])            # Cc captured
-        self.assertIn("bishelp@maplesoft.com", f["description"]) # To captured
+        self.assertIn("support@example.com", f["description"]) # To captured
 
     def test_default_reporter_when_no_override(self):
         c = fake_cfg()
-        c.default_reporter = "svc-bishelp"
+        c.default_reporter = "svc-inbox"
         f = e2j.build_issue_fields(c, self._msg(), "body")
-        self.assertEqual(f["reporter"], {"name": "svc-bishelp"})
+        self.assertEqual(f["reporter"], {"name": "svc-inbox"})
 
 
 class TestLinksAndInlineImages(unittest.TestCase):
@@ -247,10 +247,30 @@ class TestHeaderToggleAndLabels(unittest.TestCase):
         self.assertIn("BODY", f["description"])
 
     def test_extra_labels_added_after_thread_key(self):
-        c = fake_cfg(); c.extra_labels = ["email-intake", "bis"]
+        c = fake_cfg(); c.extra_labels = ["email-intake", "team-a"]
         f = e2j.build_issue_fields(c, self._msg(), "BODY")
         self.assertEqual(f["labels"][0], e2j.conversation_label("eml", "c"))
-        self.assertIn("email-intake", f["labels"]); self.assertIn("bis", f["labels"])
+        self.assertIn("email-intake", f["labels"]); self.assertIn("team-a", f["labels"])
+
+
+class TestLabelRules(unittest.TestCase):
+    def test_labels_for_sender_exact_and_domain(self):
+        rules = {"orders@example.com": ["sales-orders"], "@vendor.com": ["vendor", "external"]}
+        self.assertEqual(e2j.labels_for_sender(rules, "orders@example.com"), ["sales-orders"])
+        self.assertEqual(e2j.labels_for_sender(rules, "bob@VENDOR.com"), ["vendor", "external"])
+        self.assertEqual(e2j.labels_for_sender(rules, "nobody@x.com"), [])
+        self.assertEqual(e2j.labels_for_sender(rules, ""), [])
+
+    def test_build_issue_fields_applies_sender_labels_deduped(self):
+        c = fake_cfg()
+        c.extra_labels = ["email-intake"]
+        c.label_rules = {"orders@example.com": ["sales-orders", "email-intake"]}
+        msg = {"subject": "Order", "from": {"emailAddress": {"address": "orders@example.com"}},
+               "conversationId": "c"}
+        f = e2j.build_issue_fields(c, msg, "body")
+        self.assertEqual(f["labels"][0], e2j.conversation_label("eml", "c"))
+        self.assertIn("sales-orders", f["labels"])
+        self.assertEqual(f["labels"].count("email-intake"), 1)   # deduped
 
 
 if __name__ == "__main__":
